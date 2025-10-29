@@ -9,6 +9,7 @@ const cors = require("cors");
 const { OAuth2Client } = require("google-auth-library");
 require("dotenv").config();
 const jwt = require("jsonwebtoken");
+const { default: axios } = require("axios");
 
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
@@ -17,6 +18,11 @@ app.use(cors());
 app.use(express.json());
 
 const server = http.createServer(app);
+
+// ═══════════════════════════════════════════════════════
+// CONSTANTS
+// ═══════════════════════════════════════════════════════
+const REST_API_TIMEOUT = 5000; // 5 seconds
 
 // ═══════════════════════════════════════════════════════
 // SOCKET.IO CONFIGURATION
@@ -35,16 +41,17 @@ const io = new Server(server, {
 
 // Map userId to socketId: { userId: socketId }
 const userSocketMap = new Map();
+// Map userEmail to socketId: { email: socketId }
+const emailSocketMap = new Map();
+
+// Set of online emails
+const onlineEmails = new Set();
 
 // Map socketId to userId: { socketId: userId }
 const socketUserMap = new Map();
 
 // Store typing status: { conversationId: { userId: isTyping } }
 const typingStatus = new Map();
-
-// ═══════════════════════════════════════════════════════
-// HELPER FUNCTIONS
-// ═══════════════════════════════════════════════════════
 
 // ═══════════════════════════════════════════════════════
 // HELPER FUNCTIONS
@@ -67,6 +74,34 @@ const verifyToken = (token) => {
   }
 };
 
+//
+async function saveMessageToDB(messageData, token) {
+  try {
+    const response = await axios.post(
+      `${process.env.REST_API_URL}/api/messages`,
+      {
+        recipientId: messageData.recipientId,
+        message: messageData.message,
+        conversationId: messageData.conversationId,
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        timeout: REST_API_TIMEOUT,
+      }
+    );
+
+    console.log("✅ Message saved to database:", response.data);
+    return response.data;
+  } catch (error) {
+    console.error("❌ Failed to save message to database:", error.message);
+    // Don't throw - let real-time messaging continue even if DB save fails
+    return null;
+  }
+}
+
 /**
  * Verify JWT token and extract user data (supports both manual JWT and Google ID tokens)
  */
@@ -79,10 +114,8 @@ async function verifyTokenAndGetUser(token) {
 
   // First try: verify as manual JWT
   if (isJwt(token)) {
-    console.log("token:", token);
     try {
-      decoded = verifyToken(token); // your own JWT
-      console.log("decoded:", decoded);
+      decoded = verifyToken(token);
       return {
         id: decoded.id || decoded.sub || decoded._id,
         email: decoded.email,
@@ -102,10 +135,12 @@ async function verifyTokenAndGetUser(token) {
     });
 
     decoded = ticket.getPayload();
+    // console.log("Google decoded:", decoded);
     return {
-      id: decoded.sub, // Google's stable user ID
+      id: decoded.sub,
       email: decoded.email,
       name: decoded.name,
+
       loginType: "google",
     };
   } catch (googleErr) {
@@ -121,6 +156,13 @@ async function verifyTokenAndGetUser(token) {
  */
 function getSocketIdByUserId(userId) {
   return userSocketMap.get(userId);
+}
+
+/**
+ * Get socket ID for a specific email
+ */
+function getSocketIdByEmail(email) {
+  return emailSocketMap.get(email);
 }
 
 /**
@@ -153,7 +195,6 @@ app.get("/", (req, res) => {
 // ═══════════════════════════════════════════════════════
 // SOCKET.IO AUTHENTICATION MIDDLEWARE
 // ═══════════════════════════════════════════════════════
-
 io.use(async (socket, next) => {
   try {
     const token = socket.handshake.auth.token;
@@ -168,6 +209,7 @@ io.use(async (socket, next) => {
     socket.userId = user.id;
     socket.userEmail = user.email;
     socket.userName = user.name;
+    socket.token = token; //  Store token for REST API calls
 
     console.log(`✅ Authenticated: ${socket.userEmail} (${socket.userId})`);
     next();
@@ -193,7 +235,11 @@ io.on("connection", (socket) => {
   // Store user-socket mapping
   // ─────────────────────────────────────────────────────
   userSocketMap.set(userId, socket.id);
+  if (socket.userEmail) {
+    emailSocketMap.set(socket.userEmail, socket.id);
+  }
   socketUserMap.set(socket.id, userId);
+  onlineEmails.add(socket.userEmail);
 
   // ─────────────────────────────────────────────────────
   // Send connection confirmation
@@ -209,16 +255,21 @@ io.on("connection", (socket) => {
   // ─────────────────────────────────────────────────────
   socket.broadcast.emit("user-online", {
     userId: userId,
+    userEmail: socket.userEmail,
     userName: userName,
     timestamp: new Date().toISOString(),
   });
 
-  // Also broadcast the full current online status map
-  const statusMap = {};
+  // Also broadcast the full current online status map to ALL users
+  const statusById = {};
   getOnlineUsers().forEach((uid) => {
-    statusMap[uid] = true;
+    statusById[uid] = true;
   });
-  io.emit("online-status", statusMap);
+  const statusByEmail = {};
+  onlineEmails.forEach((email) => {
+    statusByEmail[email] = true;
+  });
+  io.emit("online-status", { byId: statusById, byEmail: statusByEmail });
 
   // ─────────────────────────────────────────────────────
   // EVENT: Join Conversation Room
@@ -238,10 +289,13 @@ io.on("connection", (socket) => {
   // ─────────────────────────────────────────────────────
   // EVENT: Send Message
   // ─────────────────────────────────────────────────────
-  socket.on("send-message", (data) => {
-    const { recipientId, message, conversationId } = data;
+  socket.on("send-message", async (data) => {
+    const { recipientId, recipientEmail, message, conversationId } = data;
 
-    console.log(`📤 Message from ${userName} to ${recipientId}`);
+    console.log(
+      `📤 Message from ${userName} (${userId}) to ${recipientId}:`,
+      message
+    );
 
     const messageData = {
       id: `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
@@ -254,20 +308,42 @@ io.on("connection", (socket) => {
       read: false,
     };
 
+    // 🔥 SAVE TO DATABASE VIA REST API
+    const savedMessage = await saveMessageToDB(messageData, socket.token);
+    console.log("Saved message response:", savedMessage);
+
+    // If saved successfully, use the DB-generated ID
+    if (savedMessage && savedMessage.data && savedMessage.data._id) {
+      messageData.id = savedMessage.data._id;
+      messageData.dbSaved = true;
+    } else {
+      messageData.dbSaved = false;
+    }
+
     // Send to recipient if online
-    const recipientSocketId = getSocketIdByUserId(recipientId);
+    let recipientSocketId = null;
+    if (recipientId) {
+      recipientSocketId = getSocketIdByUserId(recipientId);
+    }
+    if (!recipientSocketId && recipientEmail) {
+      recipientSocketId = getSocketIdByEmail(recipientEmail);
+    }
 
     if (recipientSocketId) {
-      io.to(recipientSocketId).emit("receive-message", messageData);
-      console.log(`✅ Message delivered to ${recipientId}`);
-    } else {
-      console.log(
-        `⏳ Recipient ${recipientId} is offline - message will be handled by REST API backend`
+      io.to(recipientSocketId).emit(
+        "receive-message",
+        savedMessage.data || messageData
       );
+      // console.log(`✅ Message delivered to ${recipientId} (online)`);
+    } else {
+      // console.log(
+      //   `⏳ Recipient ${recipientId} is offline - message saved to database`
+      // );
     }
 
     // Send confirmation to sender
-    socket.emit("message-sent", messageData);
+    socket.emit("message-sent", savedMessage.data || messageData);
+    console.log(`📨 Confirmation sent to sender`);
 
     // Also emit to conversation room
     io.to(messageData.conversationId).emit("new-message", messageData);
@@ -276,8 +352,11 @@ io.on("connection", (socket) => {
   // ─────────────────────────────────────────────────────
   // EVENT: Typing Indicator
   // ─────────────────────────────────────────────────────
-  socket.on("typing", ({ recipientId, isTyping }) => {
-    const conversationId = getConversationId(userId, recipientId);
+  socket.on("typing", ({ recipientId, recipientEmail, isTyping }) => {
+    const targetId = recipientId || recipientEmail || "unknown";
+    const conversationId = recipientId
+      ? getConversationId(userId, recipientId)
+      : getConversationId(userId, targetId);
 
     // Update typing status
     if (!typingStatus.has(conversationId)) {
@@ -286,7 +365,10 @@ io.on("connection", (socket) => {
     typingStatus.get(conversationId).set(userId, isTyping);
 
     // Send to recipient
-    const recipientSocketId = getSocketIdByUserId(recipientId);
+    let recipientSocketId = null;
+    if (recipientId) recipientSocketId = getSocketIdByUserId(recipientId);
+    if (!recipientSocketId && recipientEmail)
+      recipientSocketId = getSocketIdByEmail(recipientEmail);
 
     if (recipientSocketId) {
       io.to(recipientSocketId).emit("user-typing", {
@@ -302,7 +384,7 @@ io.on("connection", (socket) => {
   // EVENT: Mark Messages as Read
   // ─────────────────────────────────────────────────────
   socket.on("mark-read", ({ conversationId, messageIds }) => {
-    console.log(`📖 ${userName} marked messages as read in ${conversationId}`);
+    // console.log(`📖 ${userName} marked messages as read in ${conversationId}`);
 
     // Emit to conversation room
     io.to(conversationId).emit("messages-read", {
@@ -334,20 +416,29 @@ io.on("connection", (socket) => {
     // Remove from maps
     userSocketMap.delete(userId);
     socketUserMap.delete(socket.id);
+    if (socket.userEmail) {
+      emailSocketMap.delete(socket.userEmail);
+    }
 
     // Broadcast offline status
     socket.broadcast.emit("user-offline", {
       userId: userId,
+      userEmail: socket.userEmail,
       userName: userName,
       timestamp: new Date().toISOString(),
     });
 
     // Update and broadcast online-status map
-    const statusMap = {};
+    const statusById = {};
     getOnlineUsers().forEach((uid) => {
-      statusMap[uid] = true;
+      statusById[uid] = true;
     });
-    io.emit("online-status", statusMap);
+    onlineEmails.delete(socket.userEmail);
+    const statusByEmail = {};
+    onlineEmails.forEach((email) => {
+      statusByEmail[email] = true;
+    });
+    io.emit("online-status", { byId: statusById, byEmail: statusByEmail });
   });
 });
 
