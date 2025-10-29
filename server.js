@@ -1,13 +1,16 @@
 // ═══════════════════════════════════════════════════════
-// AGRISMART SOCKET.IO CHAT SERVER
+// AGRISMART SOCKET.IO CHAT SERVER (PURE SOCKET ONLY)
 // ═══════════════════════════════════════════════════════
 
 const express = require("express");
 const { Server } = require("socket.io");
 const http = require("http");
 const cors = require("cors");
-const jwt = require("jsonwebtoken");
+const { OAuth2Client } = require("google-auth-library");
 require("dotenv").config();
+const jwt = require("jsonwebtoken");
+
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 const app = express();
 app.use(cors());
@@ -27,7 +30,7 @@ const io = new Server(server, {
 });
 
 // ═══════════════════════════════════════════════════════
-// DATA STORAGE (In-Memory - Use Database in Production)
+// DATA STORAGE (In-Memory - Socket Only)
 // ═══════════════════════════════════════════════════════
 
 // Map userId to socketId: { userId: socketId }
@@ -43,17 +46,74 @@ const typingStatus = new Map();
 // HELPER FUNCTIONS
 // ═══════════════════════════════════════════════════════
 
-/**
- * Verify JWT token and extract user data
- */
-function verifyToken(token) {
+// ═══════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════
+
+// Helper to check if token is a JWT
+const isJwt = (token) => {
+  return typeof token === "string" && token.split(".").length === 3;
+};
+
+const verifyToken = (token) => {
+  if (!token) throw new Error("No token provided");
+
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    return decoded; // { userId, email, name, role }
-  } catch (error) {
-    console.error("Token verification failed:", error.message);
-    return null;
+    console.log("decoded inside verifyToken:", decoded);
+    return decoded;
+  } catch (err) {
+    throw new Error("Invalid JWT: " + err.message);
   }
+};
+
+/**
+ * Verify JWT token and extract user data (supports both manual JWT and Google ID tokens)
+ */
+async function verifyTokenAndGetUser(token) {
+  if (!token) {
+    throw new Error("No token provided");
+  }
+
+  let decoded;
+
+  // First try: verify as manual JWT
+  if (isJwt(token)) {
+    console.log("token:", token);
+    try {
+      decoded = verifyToken(token); // your own JWT
+      console.log("decoded:", decoded);
+      return {
+        id: decoded.id || decoded.sub || decoded._id,
+        email: decoded.email,
+        name: decoded.name,
+        loginType: "manual",
+      };
+    } catch (manualErr) {
+      // fall through and try Google token
+    }
+  }
+
+  // Try Google ID token
+  try {
+    const ticket = await googleClient.verifyIdToken({
+      idToken: token,
+      audience: process.env.GOOGLE_CLIENT_ID,
+    });
+
+    decoded = ticket.getPayload();
+    return {
+      id: decoded.sub, // Google's stable user ID
+      email: decoded.email,
+      name: decoded.name,
+      loginType: "google",
+    };
+  } catch (googleErr) {
+    // both verifications failed
+  }
+
+  // If both verifications fail
+  throw new Error("Invalid or expired token");
 }
 
 /**
@@ -78,7 +138,7 @@ function getOnlineUsers() {
 }
 
 // ═══════════════════════════════════════════════════════
-// REST API ENDPOINTS
+// HEALTH CHECK ENDPOINT
 // ═══════════════════════════════════════════════════════
 
 app.get("/", (req, res) => {
@@ -86,46 +146,35 @@ app.get("/", (req, res) => {
     status: "AgriSmart Socket.IO Server Running",
     connectedUsers: userSocketMap.size,
     onlineUsers: getOnlineUsers().length,
+    message: "Pure Socket.IO server - REST API handled by separate backend",
   });
-});
-
-// Get online status of specific users
-app.post("/api/online-status", (req, res) => {
-  const { userIds } = req.body;
-  const onlineStatus = {};
-
-  userIds.forEach((userId) => {
-    onlineStatus[userId] = userSocketMap.has(userId);
-  });
-
-  res.json({ success: true, onlineStatus });
 });
 
 // ═══════════════════════════════════════════════════════
 // SOCKET.IO AUTHENTICATION MIDDLEWARE
 // ═══════════════════════════════════════════════════════
 
-io.use((socket, next) => {
-  const token = socket.handshake.auth.token;
+io.use(async (socket, next) => {
+  try {
+    const token = socket.handshake.auth.token;
 
-  if (!token) {
-    return next(new Error("Authentication error: No token provided"));
+    if (!token) {
+      return next(new Error("Authentication error: No token provided"));
+    }
+
+    const user = await verifyTokenAndGetUser(token);
+
+    // Attach user info to socket
+    socket.userId = user.id;
+    socket.userEmail = user.email;
+    socket.userName = user.name;
+
+    console.log(`✅ Authenticated: ${socket.userEmail} (${socket.userId})`);
+    next();
+  } catch (error) {
+    console.error("Socket authentication error:", error.message);
+    next(new Error("Authentication error: Invalid token"));
   }
-
-  const decoded = verifyToken(token);
-
-  if (!decoded) {
-    return next(new Error("Authentication error: Invalid token"));
-  }
-
-  // Attach user info to socket
-  socket.userId = decoded.userId || decoded.sub || decoded._id;
-  socket.userEmail = decoded.email;
-  socket.userName = decoded.name;
-  socket.userRole = decoded.role;
-
-  console.log(`✅ Authenticated: ${socket.userName} (${socket.userId})`);
-  next();
 });
 
 // ═══════════════════════════════════════════════════════
@@ -134,7 +183,7 @@ io.use((socket, next) => {
 
 io.on("connection", (socket) => {
   const userId = socket.userId;
-  const userName = socket.userName;
+  const userName = socket.userName || socket.userEmail.split("@")[0];
 
   console.log(
     `🔌 User connected: ${userName} (${userId}) - Socket: ${socket.id}`
@@ -163,6 +212,13 @@ io.on("connection", (socket) => {
     userName: userName,
     timestamp: new Date().toISOString(),
   });
+
+  // Also broadcast the full current online status map
+  const statusMap = {};
+  getOnlineUsers().forEach((uid) => {
+    statusMap[uid] = true;
+  });
+  io.emit("online-status", statusMap);
 
   // ─────────────────────────────────────────────────────
   // EVENT: Join Conversation Room
@@ -206,7 +262,7 @@ io.on("connection", (socket) => {
       console.log(`✅ Message delivered to ${recipientId}`);
     } else {
       console.log(
-        `⏳ Recipient ${recipientId} is offline - message will be stored`
+        `⏳ Recipient ${recipientId} is offline - message will be handled by REST API backend`
       );
     }
 
@@ -285,6 +341,13 @@ io.on("connection", (socket) => {
       userName: userName,
       timestamp: new Date().toISOString(),
     });
+
+    // Update and broadcast online-status map
+    const statusMap = {};
+    getOnlineUsers().forEach((uid) => {
+      statusMap[uid] = true;
+    });
+    io.emit("online-status", statusMap);
   });
 });
 
@@ -297,10 +360,11 @@ const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
   console.log(`
   ╔════════════════════════════════════════╗
-  ║   🚀 AgriSmart Chat Server Running    ║
+  ║   🚀 AgriSmart Socket Server Running ║
   ║   📡 Port: ${PORT}                       ║
-  ║   🔐 Auth: JWT Enabled                 ║
+  ║   🔐 Auth: JWT + Google Enabled       ║
   ║   🌍 Environment: ${process.env.NODE_ENV || "development"}      ║
+  ║   📝 Pure Socket.IO - No REST API    ║
   ╚════════════════════════════════════════╝
   `);
 });
